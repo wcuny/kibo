@@ -16,7 +16,7 @@ Kibo is a command line tool useful when working on large legacy codebases with e
 
 ```bash
 # Clone and build from source
-git clone https://github.com/yourusername/kibo.git
+git clone https://github.com/wcuny/kibo.git
 cd kibo
 cargo build --release
 

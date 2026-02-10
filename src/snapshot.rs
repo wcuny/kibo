@@ -79,6 +79,8 @@ pub fn create_snapshot(
         config.files.clone(),
     );
     
+    manifest.set_ignored_patterns(config.ignore.clone());
+    
     for (relative_path, entry) in directories_to_save {
         manifest.add_directory(relative_path, entry);
     }
@@ -168,6 +170,12 @@ fn collect_files(
                 if name.starts_with('.') && name != "." {
                     return false;
                 }
+
+                if let Ok(rel_path) = e.path().strip_prefix(root) {
+                    if config.should_ignore(rel_path) {
+                        return false;
+                    }
+                }
                 true
             })
             .filter_map(|e| e.ok())
@@ -196,6 +204,14 @@ fn collect_files(
         for entry in WalkDir::new(&dir_path)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|e| {
+                if let Ok(rel_path) = e.path().strip_prefix(root) {
+                    if config.should_ignore(rel_path) {
+                        return false;
+                    }
+                }
+                true
+            })
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
@@ -210,19 +226,20 @@ fn collect_files(
                 .to_string_lossy()
                 .to_string();
 
-            if config.should_ignore(Path::new(&relative_path)) {
-                continue;
-            }
-
-            let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            if seen_paths.insert(canonical_path) {
+            // Use the actual path for deduplication to preserve symlinks
+            // Don't use canonicalize() as it resolves symlinks to their target
+            if seen_paths.insert(path.to_path_buf()) {
                 files.push((relative_path, path.to_path_buf()));
             }
         }
     }
 
     for pattern in &config.files {
-        let full_pattern = if pattern.contains("**") {
+        let full_pattern = if pattern.starts_with("./") {
+            let pattern_without_prefix = &pattern[2..];
+            format!("{}/{}", root.display(), pattern_without_prefix)
+        }
+        else if pattern.contains("**") {
             if pattern.starts_with('/') {
                 format!("{}{}", root.display(), pattern)
             }
@@ -263,8 +280,9 @@ fn collect_files(
                         continue;
                     }
 
-                    let canonical_path = entry.canonicalize().unwrap_or_else(|_| entry.clone());
-                    if seen_paths.insert(canonical_path) {
+                    // Use the actual path for deduplication to preserve symlinks
+                    // Don't use canonicalize() as it resolves symlinks to their target
+                    if seen_paths.insert(entry.clone()) {
                         // if verbose {
                         //     eprintln!("  Found: {}", relative_path);
                         // }
@@ -302,6 +320,12 @@ fn collect_directories(
                 let name = e.file_name().to_string_lossy();
                 if name.starts_with('.') && name != "." {
                     return false;
+                }
+
+                if let Ok(rel_path) = e.path().strip_prefix(root) {
+                    if config.should_ignore(rel_path) {
+                        return false;
+                    }
                 }
                 true
             })
@@ -345,8 +369,9 @@ fn collect_directories(
                 continue;
             }
 
-            let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            if seen_paths.insert(canonical_path) {
+            // Use the actual path for deduplication to preserve symlinks
+            // Don't use canonicalize() as it resolves symlinks to their target
+            if seen_paths.insert(path.to_path_buf()) {
                 let metadata = fs::metadata(path)?;
                 
                 let mtime = metadata.modified()?;
@@ -572,6 +597,115 @@ mod tests {
         assert!(files.is_empty());
     }
 
+    #[test]
+    fn test_collect_files_root_only_pattern() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        File::create(root.join("config.txt")).unwrap().write_all(b"root config").unwrap();
+        
+        fs::create_dir(root.join("subdir")).unwrap();
+        File::create(root.join("subdir/config.txt")).unwrap().write_all(b"subdir config").unwrap();
+        
+        let config = Config {
+            directories: vec![],
+            files: vec!["./config.txt".to_string()],
+            ..Default::default()
+        };
+        
+        let files = collect_files(root, &config, false).unwrap();
+        
+        assert_eq!(files.len(), 1, "Expected 1 file (root-level only), got {}", files.len());
+        assert_eq!(files[0].0, "config.txt");
+    }
+
+    #[test]
+    fn test_collect_files_root_only_wildcard() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        File::create(root.join("data1.bin")).unwrap().write_all(b"data1").unwrap();
+        File::create(root.join("data2.bin")).unwrap().write_all(b"data2").unwrap();
+        
+        fs::create_dir(root.join("nested")).unwrap();
+        File::create(root.join("nested/data3.bin")).unwrap().write_all(b"data3").unwrap();
+        
+        let config = Config {
+            directories: vec![],
+            files: vec!["./*.bin".to_string()],
+            ..Default::default()
+        };
+        
+        let files = collect_files(root, &config, false).unwrap();
+        
+        assert_eq!(files.len(), 2, "Expected 2 files (root-level only), got {}", files.len());
+        
+        let file_names: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
+        assert!(file_names.contains(&"data1.bin".to_string()));
+        assert!(file_names.contains(&"data2.bin".to_string()));
+        assert!(!file_names.contains(&"nested/data3.bin".to_string()));
+    }
+
+    #[test]
+    fn test_collect_files_root_only_subdirectory() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        fs::create_dir(root.join("data")).unwrap();
+        File::create(root.join("data/file1.txt")).unwrap().write_all(b"file1").unwrap();
+        File::create(root.join("data/file2.txt")).unwrap().write_all(b"file2").unwrap();
+        
+        fs::create_dir_all(root.join("project/data")).unwrap();
+        File::create(root.join("project/data/file3.txt")).unwrap().write_all(b"file3").unwrap();
+        
+        let config = Config {
+            directories: vec![],
+            files: vec!["./data/*.txt".to_string()],
+            ..Default::default()
+        };
+        
+        let files = collect_files(root, &config, false).unwrap();
+        
+        assert_eq!(files.len(), 2, "Expected 2 files (root-level data/ only), got {}", files.len());
+        
+        let file_names: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
+        assert!(file_names.contains(&"data/file1.txt".to_string()));
+        assert!(file_names.contains(&"data/file2.txt".to_string()));
+        assert!(!file_names.contains(&"project/data/file3.txt".to_string()));
+    }
+
+    #[test]
+    fn test_collect_files_recursive_vs_root_only() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        File::create(root.join("Makefile")).unwrap().write_all(b"root makefile").unwrap();
+        
+        fs::create_dir(root.join("sub1")).unwrap();
+        File::create(root.join("sub1/Makefile")).unwrap().write_all(b"sub1 makefile").unwrap();
+        fs::create_dir(root.join("sub2")).unwrap();
+        File::create(root.join("sub2/Makefile")).unwrap().write_all(b"sub2 makefile").unwrap();
+        
+        let config_recursive = Config {
+            directories: vec![],
+            files: vec!["Makefile".to_string()],
+            ..Default::default()
+        };
+        
+        let files_recursive = collect_files(root, &config_recursive, false).unwrap();
+        assert_eq!(files_recursive.len(), 3, "Recursive should find all 3 Makefiles");
+        
+        let config_root_only = Config {
+            directories: vec![],
+            files: vec!["./Makefile".to_string()],
+            ..Default::default()
+        };
+        
+        let files_root_only = collect_files(root, &config_root_only, false).unwrap();
+        assert_eq!(files_root_only.len(), 1, "Root-only should find only 1 Makefile");
+        assert_eq!(files_root_only[0].0, "Makefile");
+    }
+
     // Note: collect_files searches the entire workspace tree for directories
     // whose NAME matches tracked directories. It requires complex integration testing.
 
@@ -585,6 +719,115 @@ mod tests {
         
         let dirs = collect_directories(temp_dir.path(), &config, false).unwrap();
         assert!(dirs.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_collect_files_preserves_multiple_symlinks_to_same_target() {
+        use std::os::unix::fs::symlink;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        let target_file = root.join("data.bin");
+        File::create(&target_file).unwrap().write_all(b"file contents").unwrap();
+        
+        let link1 = root.join("data-latest.bin");
+        let link2 = root.join("data-v1.bin");
+        let link3 = root.join("data-stable.bin");
+        
+        symlink("data.bin", &link1).unwrap();
+        symlink("data.bin", &link2).unwrap();
+        symlink("data.bin", &link3).unwrap();
+        
+        let config = Config {
+            directories: vec![],
+            files: vec![
+                "data.bin".to_string(),
+                "data-latest.bin".to_string(),
+                "data-v1.bin".to_string(),
+                "data-stable.bin".to_string(),
+            ],
+            ..Default::default()
+        };
+        
+        let files = collect_files(root, &config, false).unwrap();
+        
+        assert_eq!(files.len(), 4, "Expected 4 files (3 symlinks + 1 target), got {}", files.len());
+        
+        let file_names: Vec<String> = files.iter()
+            .map(|(rel_path, _)| rel_path.clone())
+            .collect();
+        
+        assert!(file_names.contains(&"data.bin".to_string()), "Missing data.bin");
+        assert!(file_names.contains(&"data-latest.bin".to_string()), "Missing data-latest.bin");
+        assert!(file_names.contains(&"data-v1.bin".to_string()), "Missing data-v1.bin");
+        assert!(file_names.contains(&"data-stable.bin".to_string()), "Missing data-stable.bin");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_process_file_distinguishes_symlinks_from_target() {
+        use std::os::unix::fs::symlink;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        let target = root.join("target.txt");
+        File::create(&target).unwrap().write_all(b"content").unwrap();
+        
+        let link = root.join("link.txt");
+        symlink("target.txt", &link).unwrap();
+        
+        let hash_cache = Arc::new(Mutex::new(HashCache::new()));
+        
+        let target_result = process_file(&target, "target.txt", hash_cache.clone()).unwrap();
+        let link_result = process_file(&link, "link.txt", hash_cache).unwrap();
+        
+        assert!(!target_result.entry.is_symlink);
+        assert_eq!(target_result.entry.symlink_target, None);
+        assert_eq!(target_result.entry.size, 7); // "content" is 7 bytes
+        
+        assert!(link_result.entry.is_symlink);
+        assert_eq!(link_result.entry.symlink_target, Some("target.txt".to_string()));
+        assert_eq!(link_result.entry.size, 0);
+        
+        assert_ne!(target_result.entry.hash, link_result.entry.hash);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_collect_files_does_not_deduplicate_by_canonical_path() {
+        use std::os::unix::fs::symlink;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        let target = root.join("target.txt");
+        File::create(&target).unwrap().write_all(b"test").unwrap();
+        
+        let link1 = root.join("link1.txt");
+        let link2 = root.join("link2.txt");
+        symlink("target.txt", &link1).unwrap();
+        symlink("target.txt", &link2).unwrap();
+        
+        let config = Config {
+            directories: vec![],
+            files: vec!["*.txt".to_string()],
+            ..Default::default()
+        };
+        
+        let files = collect_files(root, &config, false).unwrap();
+        
+        assert_eq!(files.len(), 3);
+        
+        let file_names: Vec<String> = files.iter()
+            .map(|(rel_path, _)| rel_path.clone())
+            .collect();
+        
+        assert!(file_names.contains(&"target.txt".to_string()));
+        assert!(file_names.contains(&"link1.txt".to_string()));
+        assert!(file_names.contains(&"link2.txt".to_string()));
     }
 
     // Note: collect_directories requires integration testing with proper workspace structure

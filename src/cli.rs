@@ -56,6 +56,14 @@ pub enum Commands {
         /// Add file patterns to config (comma-separated, e.g., --add-files="*.dat,*.o")
         #[arg(long = "add-files", value_delimiter = ',', require_equals = true)]
         add_files: Option<Vec<String>>,
+
+        /// Override ignore patterns from config (comma-separated, e.g., --ignore="build/*,*.tmp")
+        #[arg(long = "ignore", value_delimiter = ',', conflicts_with = "add_ignore", require_equals = true)]
+        ignore: Option<Vec<String>>,
+
+        /// Add ignore patterns to config (comma-separated, e.g., --add-ignore="build/*,*.tmp")
+        #[arg(long = "add-ignore", value_delimiter = ',', require_equals = true)]
+        add_ignore: Option<Vec<String>>,
     },
 
     /// Load a previously saved snapshot
@@ -67,6 +75,10 @@ pub enum Commands {
         /// Show verbose output
         #[arg(short = 'v', long = "verbose")]
         verbose: bool,
+
+        /// Dry run - show what would be done without actually doing it
+        #[arg(short = 'n', long = "dry-run")]
+        dry_run: bool,
 
         /// Include database load (snapshot must include a database dump)
         #[arg(long = "include-db")]

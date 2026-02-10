@@ -54,6 +54,8 @@ fn run() -> Result<()> {
             add_directories,
             files,
             add_files,
+            ignore,
+            add_ignore,
         } => {
             let progress_config = ProgressConfig::from_flags(progress, no_progress, config.progress);
             
@@ -75,6 +77,12 @@ fn run() -> Result<()> {
                 effective_config.files.extend(add_file_patterns.iter().cloned());
             }
             
+            if let Some(ref ignore_patterns) = ignore {
+                effective_config.ignore = ignore_patterns.clone();
+            } else if let Some(ref add_ignore_patterns) = add_ignore {
+                effective_config.ignore.extend(add_ignore_patterns.iter().cloned());
+            }
+            
             if effective_config.directories.is_empty() && effective_config.files.is_empty() {
                 anyhow::bail!(
                     "Configuration error: both 'directories' and 'files' lists are empty.\n\
@@ -84,11 +92,11 @@ fn run() -> Result<()> {
             effective_config.validate_compression_level();
             
             cmd_save(&root, &name, &effective_config, yes, verbose, include_db, progress_config, &config, 
-                     compression_level, &directories, &add_directories, &files, &add_files)?
+                     compression_level, &directories, &add_directories, &files, &add_files, &ignore, &add_ignore)?
         },
-        Commands::Load { name, verbose, include_db, progress, no_progress } => {
+        Commands::Load { name, verbose, dry_run, include_db, progress, no_progress } => {
             let progress_config = ProgressConfig::from_flags(progress, no_progress, config.progress);
-            cmd_load(&root, &name, verbose, include_db, &config, progress_config)?
+            cmd_load(&root, &name, verbose, dry_run, include_db, &config, progress_config)?
         },
         Commands::List { sort_by_name, sort_by_size, sort_by_created, sort_by_files } => {
             cmd_list(&root, sort_by_name, sort_by_size, sort_by_created, sort_by_files)?
@@ -138,11 +146,14 @@ directories = ["build", "target", "out"]
 # Examples:
 #   "moc_*.cpp"           -> finds all moc_*.cpp files anywhere
 #   "*.o"                 -> finds all .o files anywhere
+#   "./config.txt"        -> finds config.txt only at project root (not subdirectories)
+#   "./data/*.bin"        -> finds .bin files only in root-level data/ directory
 #   "frontend/dist/*.js"  -> finds .js files in any frontend/dist directory
 #   "**/out/**/*.a"       -> finds .a files in any out directory (explicit recursive)
 files = [
     # "moc_*.cpp",
     # "*.o",
+    # "./Makefile",  # Only at project root
 ]
 
 # Patterns to ignore (optional)
@@ -218,6 +229,8 @@ fn cmd_save(
     add_directories: &Option<Vec<String>>,
     files: &Option<Vec<String>>,
     add_files: &Option<Vec<String>>,
+    ignore: &Option<Vec<String>>,
+    add_ignore: &Option<Vec<String>>,
 ) -> Result<()> {
     let timer = Timer::new();
     
@@ -356,6 +369,12 @@ fn cmd_save(
     if let Some(add_file_patterns) = add_files {
         flags.push(format!("--add-files={}", add_file_patterns.join(",")));
     }
+    if let Some(ignore_patterns) = ignore {
+        flags.push(format!("--ignore={}", ignore_patterns.join(",")));
+    }
+    if let Some(add_ignore_patterns) = add_ignore {
+        flags.push(format!("--add-ignore={}", add_ignore_patterns.join(",")));
+    }
     let entry = HistoryEntry::new("SAVE", Some(name), flags);
     log_entry(root, &entry);
 
@@ -363,25 +382,39 @@ fn cmd_save(
 }
 
 /// Load a snapshot
-fn cmd_load(root: &std::path::Path, name: &str, verbose: bool, include_db: bool, config: &Config, progress_config: ProgressConfig) -> Result<()> {
+fn cmd_load(root: &std::path::Path, name: &str, verbose: bool, dry_run: bool, include_db: bool, config: &Config, progress_config: ProgressConfig) -> Result<()> {
 
     // Load manifest first to check for database dump
     let manifest = Manifest::load(root, name)?;
 
-    let stats = load_snapshot(root, name, verbose, progress_config)?;
+    let stats = load_snapshot(root, name, verbose, dry_run, progress_config)?;
 
-    println!("\nSnapshot '{}' loaded successfully", name);
-    println!("  Files loaded: {}", stats.files_loaded);
-    println!(
-        "  {} copied, {} unchanged, {} symlinks",
-        stats.copies, stats.unchanged, stats.symlinks
-    );
+    if dry_run {
+        println!("\n[DRY RUN] Would load snapshot '{}'", name);
+        println!("  Files to load: {}", stats.files_loaded);
+        println!(
+            "  {} to copy, {} unchanged, {} symlinks, {} removed",
+            stats.copies, stats.unchanged, stats.symlinks, stats.removed
+        );
+    }
+    else {
+        println!("\nSnapshot '{}' loaded successfully", name);
+        println!("  Files loaded: {}", stats.files_loaded);
+        println!(
+            "  {} copied, {} unchanged, {} symlinks, {} removed",
+            stats.copies, stats.unchanged, stats.symlinks, stats.removed
+        );
+    }
 
     if include_db {
-        if config.database.is_none() {
+        if dry_run {
+            println!("\n[DRY RUN] Would restore database");
+        } 
+        else if config.database.is_none() {
             eprintln!("\nWarning: --include-db specified but no [database] section found in config");
             eprintln!("Database connection settings are required to load database dumps.");
-        } else if let Some(ref db_config) = config.database {
+        } 
+        else if let Some(ref db_config) = config.database {
             let loaded = load_database(root, &manifest, db_config, verbose)?;
             if loaded {
                 println!("\nDatabase loaded successfully");
@@ -389,11 +422,13 @@ fn cmd_load(root: &std::path::Path, name: &str, verbose: bool, include_db: bool,
         }
     }
 
-    let mut flags = Vec::new();
-    if verbose { flags.push("--verbose".to_string()); }
-    if include_db { flags.push("--include-db".to_string()); }
-    let entry = HistoryEntry::new("LOAD", Some(name), flags);
-    log_entry(root, &entry);
+    if !dry_run {
+        let mut flags = Vec::new();
+        if verbose { flags.push("--verbose".to_string()); }
+        if include_db { flags.push("--include-db".to_string()); }
+        let entry = HistoryEntry::new("LOAD", Some(name), flags);
+        log_entry(root, &entry);
+    }
 
     Ok(())
 }
@@ -410,11 +445,14 @@ fn cmd_list(root: &std::path::Path, sort_by_name: bool, sort_by_size: bool, sort
 
     if sort_by_name {
         snapshots.sort_by(|a, b| a.name.cmp(&b.name));
-    } else if sort_by_size {
+    }
+    else if sort_by_size {
         snapshots.sort_by(|a, b| b.total_size.cmp(&a.total_size)); // Largest first
-    } else if sort_by_created {
+    }
+    else if sort_by_created {
         snapshots.sort_by(|a, b| b.created_at.cmp(&a.created_at)); // Newest first
-    } else if sort_by_files {
+    } 
+    else if sort_by_files {
         snapshots.sort_by(|a, b| b.file_count.cmp(&a.file_count)); // Most first
     }
     // Default: keep order from list_snapshots (newest first by creation time)

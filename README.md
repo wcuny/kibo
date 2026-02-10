@@ -4,7 +4,7 @@
 
 **Fast, deterministic snapshot and restore for build artifacts**
 
-Kibo is a command line tool useful when working on large legacy codebases with expensive builds. Save fully built directory states and load them quickly without rebuilding, for rapid context switching between branches, configurations, and experiments.
+Kibo is a command line tool useful when working on large legacy codebases with expensive builds. Save directory states and load them quickly without rebuilding, for rapid context switching between branches, configurations, and experiments.
 
 [![License](https://img.shields.io/badge/license-GPLv3-blue)]()
 
@@ -72,8 +72,20 @@ progress = true
 ### How Tracking Works
 
 - **Directories**: Kibo recursively searches your workspace for directories matching the specified names (e.g., `build`). All instances are tracked, including nested ones like `temp/build`, `project/build`, etc.
-- **Files**: Glob patterns are searched recursively across the entire workspace. Use `**` for explicit recursive matching.
+- **Files**: Glob patterns are searched recursively across the entire workspace. Use `**` for explicit recursive matching. **To match files only at the project root**, prefix the pattern with `./` (e.g., `"./Makefile"` matches `Makefile` at root but not `subdir/Makefile`).
 - **Empty directories**: Tracked and restored with exact permissions and modification times.
+
+#### File Pattern Examples
+
+```toml
+files = [
+    "*.o",              # Finds all .o files anywhere in workspace
+    "moc_*.cpp",        # Finds all moc_*.cpp files anywhere
+    "./config.json",    # Finds config.json ONLY at project root
+    "./data/*.bin",     # Finds .bin files ONLY in root-level data/ directory
+    "**/dist/**/*.js",  # Finds .js files in any dist directory (explicit recursive)
+]
+```
 
 ### Database Configuration
 
@@ -162,15 +174,22 @@ Load a previously saved snapshot.
 # Basic load
 kibo load my-snapshot
 
+# Dry run - preview what would be done without actually loading
+kibo load my-snapshot --dry-run
+
 # Load including database restore
 kibo load my-snapshot --include-db
 
 # Verbose output
 kibo load my-snapshot -v
+
+# Dry run with verbose output
+kibo load my-snapshot -nv
 ```
 
 **Options:**
 - `-v, --verbose` - Show detailed output
+- `-n, --dry-run` - Preview what would be done without actually performing the load
 - `--include-db` - Restore database dump if included in snapshot
 - `--progress` / `--no-progress` - Force enable/disable progress bars
 
@@ -180,6 +199,14 @@ kibo load my-snapshot -v
 - Preserves untracked files and directories
 - Restores file permissions and modification times
 - If `--include-db` is specified and the snapshot contains a database dump, restores the database using `mysql` command
+
+**Dry Run Mode:**
+The `--dry-run` flag is helpful for debugging file patterns and ignore patterns:
+- Shows which files would be deleted as stale
+- Shows which files would be loaded or are unchanged
+- Shows which directories would be created or removed
+- Displays tracked patterns and ignored patterns from the snapshot
+- Does not modify any files or directories
 
 **Database Restore Requirements:**
 - `mysql` command must be available in PATH
@@ -275,15 +302,13 @@ kibo config
 
 ### Content-Addressed Storage
 
-Kibo uses a content-addressed blob store (`.kibo/store/`) where each file is stored by its BLAKE3 hash. This enables:
-- **Automatic deduplication**: Identical files are stored only once
-- **Integrity verification**: Corruption is detected on load
-- **Efficient storage**: Only unique content consumes disk space
+Kibo uses a content-addressed blob store (`.kibo/store/`) where each file is stored by its BLAKE3 hash.
 
 ### Snapshot Manifests
 
 Each snapshot is stored as a JSON manifest (`.kibo/manifests/<name>.json`) containing:
 - Tracked directory and file patterns
+- Ignore patterns
 - Complete directory structure with metadata (permissions, mtimes)
 - File entries with hashes, sizes, permissions, and mtimes
 - Snapshot metadata (creation time, version)
@@ -408,9 +433,9 @@ kibo load release-candidate --include-db
 Contributions are welcome! Please:
 
 1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+2. Create a feature branch (`git checkout -b feature/your-feature`)
 3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
+4. Push to the branch (`git push origin feature/your-feature`)
 5. Open a Pull Request
 
 ---

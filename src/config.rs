@@ -226,7 +226,7 @@ pub fn find_repo_root() -> Result<PathBuf> {
             Some(parent) => dir = parent,
             None => bail!(
                 "Could not find {} in current directory or any parent directory.\n\
-                 Please create a configuration file or run from within a kibo-enabled repository.",
+                 Please create a configuration file using 'kibo init' or run from within a kibo-enabled repository.",
                 CONFIG_FILENAME
             ),
         }

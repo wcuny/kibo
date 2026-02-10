@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use glob;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -69,6 +70,10 @@ pub struct Manifest {
     #[serde(default)]
     pub tracked_files: Vec<String>,
     
+    /// List of ignore patterns that were active during snapshot creation
+    #[serde(default)]
+    pub ignored_patterns: Vec<String>,
+    
     /// Mapping of relative paths to directory entries
     #[serde(default)]
     pub directories: HashMap<String, DirectoryEntry>,
@@ -102,6 +107,7 @@ impl Manifest {
             created_at: Utc::now(),
             tracked_directories: Vec::new(),
             tracked_files: Vec::new(),
+            ignored_patterns: Vec::new(),
             directories: HashMap::new(),
             files: HashMap::new(),
             total_size: 0,
@@ -116,6 +122,11 @@ impl Manifest {
     pub fn set_tracked_paths(&mut self, directories: Vec<String>, files: Vec<String>) {
         self.tracked_directories = directories;
         self.tracked_files = files;
+    }
+    
+    /// Set ignored patterns from the config
+    pub fn set_ignored_patterns(&mut self, ignored_patterns: Vec<String>) {
+        self.ignored_patterns = ignored_patterns;
     }
 
     /// Add a directory entry to the manifest
@@ -188,6 +199,36 @@ impl Manifest {
     /// Get human-readable size
     pub fn human_size(&self) -> String {
         format_size(self.total_size)
+    }
+    
+    /// Check if a path should be ignored based on manifest's ignore patterns
+    pub fn should_ignore(&self, relative_path: &Path) -> bool {
+        let path_str = relative_path.to_string_lossy();
+        
+        for pattern in &self.ignored_patterns {
+            // Try glob pattern matching
+            if let Ok(glob_pattern) = glob::Pattern::new(pattern) {
+                if glob_pattern.matches(&path_str) {
+                    return true;
+                }
+            }
+            
+            // Try prefix matching
+            if path_str.starts_with(pattern) {
+                return true;
+            }
+            
+            // Try component matching
+            for component in relative_path.components() {
+                if let std::path::Component::Normal(c) = component {
+                    if c.to_string_lossy() == *pattern {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        false
     }
 }
 
@@ -277,6 +318,48 @@ mod tests {
         
         assert_eq!(manifest.tracked_directories, vec!["src", "tests"]);
         assert_eq!(manifest.tracked_files, vec!["*.txt"]);
+    }
+
+    #[test]
+    fn test_manifest_set_ignored_patterns() {
+        let mut manifest = Manifest::new("test".to_string());
+        
+        manifest.set_ignored_patterns(
+            vec!["*.log".to_string(), "tmp/".to_string(), "node_modules".to_string()],
+        );
+        
+        assert_eq!(manifest.ignored_patterns, vec!["*.log", "tmp/", "node_modules"]);
+    }
+
+    #[test]
+    fn test_manifest_should_ignore_glob_pattern() {
+        let mut manifest = Manifest::new("test".to_string());
+        manifest.set_ignored_patterns(vec!["*.log".to_string(), "*.tmp".to_string()]);
+        
+        assert!(manifest.should_ignore(Path::new("debug.log")));
+        assert!(manifest.should_ignore(Path::new("test.tmp")));
+        assert!(!manifest.should_ignore(Path::new("test.txt")));
+    }
+
+    #[test]
+    fn test_manifest_should_ignore_prefix_pattern() {
+        let mut manifest = Manifest::new("test".to_string());
+        manifest.set_ignored_patterns(vec!["tmp/".to_string(), "build/".to_string()]);
+        
+        assert!(manifest.should_ignore(Path::new("tmp/file.txt")));
+        assert!(manifest.should_ignore(Path::new("build/output.o")));
+        assert!(!manifest.should_ignore(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn test_manifest_should_ignore_component_pattern() {
+        let mut manifest = Manifest::new("test".to_string());
+        manifest.set_ignored_patterns(vec!["node_modules".to_string(), ".git".to_string()]);
+        
+        assert!(manifest.should_ignore(Path::new("node_modules/package/index.js")));
+        assert!(manifest.should_ignore(Path::new("src/node_modules/lib.js")));
+        assert!(manifest.should_ignore(Path::new(".git/config")));
+        assert!(!manifest.should_ignore(Path::new("src/index.js")));
     }
 
     #[test]
@@ -432,6 +515,7 @@ mod tests {
             created_at: Utc::now(),
             tracked_directories: vec![],
             tracked_files: vec![],
+            ignored_patterns: vec![],
             directories: HashMap::new(),
             files: HashMap::new(),
             total_size: 1024 * 1024, // 1 MB

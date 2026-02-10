@@ -1,0 +1,12 @@
+v0.2.0
+- fixed issue with symlinks being ignored due to deduplication logic
+- ignore patterns are now stored in the snapshot
+- fixed issue where ignored files were being deleted upon load if they matched file patterns in the snapshot
+- added --ignore and --add-ignore CLI options to dynamically manage ignore patterns
+- added support for root level file patterns using "./" prefix to avoid ambiguity with ignore patterns
+- added --dry-run option to the load command to show what would be done without actually doing it
+- added removed files to the summary at the end of the load process
+- optimized save and load by skipping ignored patterns earlier in the process
+
+v0.1.0
+- initial release

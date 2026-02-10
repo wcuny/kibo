@@ -18,6 +18,7 @@ pub fn load_snapshot(
     root: &Path,
     name: &str,
     verbose: bool,
+    dry_run: bool,
     progress_config: ProgressConfig,
 ) -> Result<LoadStats> {
     use crate::progress::Timer;
@@ -25,7 +26,14 @@ pub fn load_snapshot(
     
     let manifest = Manifest::load(root, name)?;
 
-    if verbose {
+    if dry_run {
+        println!("[DRY RUN] Loading snapshot '{}' ({} files, {})", name, manifest.file_count, manifest.human_size());
+        println!("\nTracked directories: {:?}", manifest.tracked_directories);
+        println!("Tracked file patterns: {:?}", manifest.tracked_files);
+        if !manifest.ignored_patterns.is_empty() {
+            println!("Ignored patterns: {:?}", manifest.ignored_patterns);
+        }
+    } else if verbose {
         eprintln!(
             "Loading snapshot '{}' ({} files, {})",
             name,
@@ -36,45 +44,129 @@ pub fn load_snapshot(
 
     let store = Store::new(root);
 
-    let setup_spinner = if !verbose {
+    let setup_spinner = if !verbose && !dry_run {
         Some(crate::progress::Spinner::new(progress_config, "Preparing load"))
     }
     else {
         None
     };
 
-    if verbose {
-        eprintln!("Verifying snapshot integrity");
+    if verbose || dry_run {
+        if dry_run {
+            println!("\n[DRY RUN] Verifying snapshot integrity");
+        } else {
+            eprintln!("Verifying snapshot integrity");
+        }
     }
     verify_snapshot(&manifest, &store)?;
 
-    if verbose {
-        eprintln!("Tracked directories: {:?}", manifest.tracked_directories);
-        eprintln!("Tracked files: {:?}", manifest.tracked_files);
+    if verbose || dry_run {
+        if dry_run {
+            println!("[DRY RUN] Tracked directories: {:?}", manifest.tracked_directories);
+            println!("[DRY RUN] Tracked files: {:?}", manifest.tracked_files);
+        } else {
+            eprintln!("Tracked directories: {:?}", manifest.tracked_directories);
+            eprintln!("Tracked files: {:?}", manifest.tracked_files);
+        }
     }
 
-    cleanup_stale_files(root, &manifest, verbose)?;
+    let stats = Arc::new(Mutex::new(LoadStats::default()));
 
-    cleanup_empty_directories(root, &manifest, verbose)?;
+    cleanup_stale_files(root, &manifest, verbose, dry_run, stats.clone())?;
+
+    cleanup_empty_directories(root, &manifest, verbose, dry_run)?;
     
-    restore_directories(root, &manifest, verbose)?;
+    restore_directories(root, &manifest, verbose, dry_run)?;
 
     if let Some(spinner) = setup_spinner {
         spinner.finish();
     }
 
-    let stats = load_files(root, &manifest, &store, verbose, progress_config)?;
+    load_files(root, &manifest, &store, verbose, dry_run, progress_config, stats.clone())?;
+
+    let stats = Arc::try_unwrap(stats)
+        .expect("Stats still has references")
+        .into_inner()
+        .expect("Stats mutex poisoned");
 
     let elapsed = timer.elapsed_string();
     
-    if verbose {
-        eprintln!(
-            "Load complete: {} files ({} copied, {} unchanged, {} symlinks)",
+    if dry_run {
+        println!(
+            "\n[DRY RUN] Would load: {} files ({} to copy, {} unchanged, {} symlinks, {} removed)",
             stats.files_loaded,
             stats.copies,
             stats.unchanged,
-            stats.symlinks
+            stats.symlinks,
+            stats.removed
         );
+        
+        if !stats.copied_files.is_empty() {
+            println!("\nFiles to copy:");
+            for file in &stats.copied_files {
+                println!("  - {}", file);
+            }
+        }
+        
+        if !stats.unchanged_files.is_empty() {
+            println!("\nFiles unchanged:");
+            for file in &stats.unchanged_files {
+                println!("  - {}", file);
+            }
+        }
+        
+        if !stats.symlink_files.is_empty() {
+            println!("\nSymlinks to restore:");
+            for file in &stats.symlink_files {
+                println!("  - {}", file);
+            }
+        }
+        
+        if !stats.removed_files.is_empty() {
+            println!("\nFiles to remove:");
+            for file in &stats.removed_files {
+                println!("  - {}", file);
+            }
+        }
+        
+        println!("\n[DRY RUN] Completed in {}", elapsed);
+    } else if verbose {
+        eprintln!(
+            "Load complete: {} files ({} copied, {} unchanged, {} symlinks, {} removed)",
+            stats.files_loaded,
+            stats.copies,
+            stats.unchanged,
+            stats.symlinks,
+            stats.removed
+        );
+        
+        if !stats.copied_files.is_empty() {
+            eprintln!("\nFiles copied:");
+            for file in &stats.copied_files {
+                eprintln!("  - {}", file);
+            }
+        }
+        
+        if !stats.unchanged_files.is_empty() {
+            eprintln!("\nFiles unchanged:");
+            for file in &stats.unchanged_files {
+                eprintln!("  - {}", file);
+            }
+        }
+        
+        if !stats.symlink_files.is_empty() {
+            eprintln!("\nSymlinks restored:");
+            for file in &stats.symlink_files {
+                eprintln!("  - {}", file);
+            }
+        }
+        
+        if !stats.removed_files.is_empty() {
+            eprintln!("\nFiles removed:");
+            for file in &stats.removed_files {
+                eprintln!("  - {}", file);
+            }
+        }
     }
     else {
         println!("Load completed in {}", elapsed);
@@ -88,9 +180,15 @@ fn cleanup_stale_files(
     root: &Path,
     manifest: &Manifest,
     verbose: bool,
+    dry_run: bool,
+    stats: Arc<Mutex<LoadStats>>,
 ) -> Result<()> {
-    if verbose {
-        eprintln!("Cleaning up stale files in tracked paths");
+    if verbose || dry_run {
+        if dry_run {
+            println!("\n[DRY RUN] Would clean up stale files in tracked paths");
+        } else {
+            eprintln!("Cleaning up stale files in tracked paths");
+        }
     }
 
     let manifest_files: HashSet<PathBuf> = manifest
@@ -135,30 +233,58 @@ fn cleanup_stale_files(
 
         for entry in WalkDir::new(&dir_path)
             .into_iter()
+            .filter_entry(|e| {
+                if e.file_name() == ".kibo" {
+                    return false;
+                }
+
+                if let Ok(rel_path) = e.path().strip_prefix(root) {
+                    if manifest.should_ignore(rel_path) {
+                        return false;
+                    }
+                }
+                true
+            })
             .filter_map(|e| e.ok())
             .filter(|e| !e.file_type().is_dir())
         {
             let file_path = entry.path();
-            
-            if file_path.starts_with(root.join(".kibo")) {
-                continue;
-            }
 
             if !manifest_files.contains(file_path) {
-                if verbose {
+                
+                if verbose || dry_run {
                     let rel_path = file_path.strip_prefix(root).unwrap_or(file_path);
-                    eprintln!("    Deleting stale file: {}", rel_path.display());
+                    if dry_run {
+                        println!("    [DRY RUN] Would delete stale file: {}", rel_path.display());
+                    } else {
+                        eprintln!("    Deleting stale file: {}", rel_path.display());
+                    }
                 }
                 
-                fs::remove_file(file_path)
-                    .with_context(|| format!("Failed to delete stale file: {}", file_path.display()))?;
+                let relative_path = file_path.strip_prefix(root)
+                    .unwrap_or(file_path)
+                    .to_string_lossy()
+                    .to_string();
+                
+                if !dry_run {
+                    fs::remove_file(file_path)
+                        .with_context(|| format!("Failed to delete stale file: {}", file_path.display()))?;
+                }
+                
+                let mut s = stats.lock().unwrap();
+                s.removed += 1;
+                s.removed_files.push(relative_path);
                 deleted_count += 1;
             }
         }
     }
 
     for file_pattern in &manifest.tracked_files {
-        let full_pattern = if file_pattern.contains("**") {
+        let full_pattern = if file_pattern.starts_with("./") {
+            let pattern_without_prefix = &file_pattern[2..];
+            format!("{}/{}", root.display(), pattern_without_prefix)
+        }
+        else if file_pattern.contains("**") {
             if file_pattern.starts_with('/') {
                 format!("{}{}", root.display(), file_pattern)
             }
@@ -182,21 +308,48 @@ fn cleanup_stale_files(
                         continue;
                     }
 
-                    if verbose {
+                    let relative_path = entry.strip_prefix(root).unwrap_or(&entry);
+                    if manifest.should_ignore(relative_path) {
+                        if verbose {
+                            eprintln!("    Skipping ignored file: {}", relative_path.display());
+                        }
+                        continue;
+                    }
+
+                    if verbose || dry_run {
                         let rel_path = entry.strip_prefix(root).unwrap_or(&entry);
-                        eprintln!("    Deleting stale file: {}", rel_path.display());
+                        if dry_run {
+                            println!("    [DRY RUN] Would delete stale file: {}", rel_path.display());
+                        } else {
+                            eprintln!("    Deleting stale file: {}", rel_path.display());
+                        }
                     }
                     
-                    fs::remove_file(&entry)
-                        .with_context(|| format!("Failed to delete stale file: {}", entry.display()))?;
+                    let relative_path = entry.strip_prefix(root)
+                        .unwrap_or(&entry)
+                        .to_string_lossy()
+                        .to_string();
+                    
+                    if !dry_run {
+                        fs::remove_file(&entry)
+                            .with_context(|| format!("Failed to delete stale file: {}", entry.display()))?;
+                    }
+                    
+                    let mut s = stats.lock().unwrap();
+                    s.removed += 1;
+                    s.removed_files.push(relative_path);
                     deleted_count += 1;
                 }
             }
         }
     }
 
-    if verbose && deleted_count > 0 {
-        eprintln!("  Deleted {} stale files", deleted_count);
+    if (verbose || dry_run) && deleted_count > 0 {
+        if dry_run {
+            println!("  [DRY RUN] Would delete {} stale files", deleted_count);
+        } else {
+            eprintln!("  Deleted {} stale files", deleted_count);
+        }
     }
 
     Ok(())
@@ -207,9 +360,14 @@ fn cleanup_empty_directories(
     root: &Path,
     manifest: &Manifest,
     verbose: bool,
+    dry_run: bool,
 ) -> Result<()> {
-    if verbose {
-        eprintln!("Cleaning up empty directories");
+    if verbose || dry_run {
+        if dry_run {
+            println!("\n[DRY RUN] Would clean up empty directories");
+        } else {
+            eprintln!("Cleaning up empty directories");
+        }
     }
 
     let mut required_dirs: HashSet<PathBuf> = HashSet::new();
@@ -267,25 +425,37 @@ fn cleanup_empty_directories(
 
         if let Ok(mut entries) = fs::read_dir(&dir_path) {
             if entries.next().is_none() {
-                if verbose {
+                if verbose || dry_run {
                     let rel_path = dir_path.strip_prefix(root).unwrap_or(&dir_path);
-                    eprintln!("    Deleting empty directory: {}", rel_path.display());
+                    if dry_run {
+                        println!("    [DRY RUN] Would delete empty directory: {}", rel_path.display());
+                    } else {
+                        eprintln!("    Deleting empty directory: {}", rel_path.display());
+                    }
                 }
                 
-                if let Err(e) = fs::remove_dir(&dir_path) {
-                    if verbose {
-                        eprintln!("    Warning: Failed to remove directory {}: {}", dir_path.display(), e);
+                if !dry_run {
+                    if let Err(e) = fs::remove_dir(&dir_path) {
+                        if verbose {
+                            eprintln!("    Warning: Failed to remove directory {}: {}", dir_path.display(), e);
+                        }
+                    } 
+                    else {
+                        deleted_count += 1;
                     }
-                } 
-                else {
+                } else {
                     deleted_count += 1;
                 }
             }
         }
     }
 
-    if verbose && deleted_count > 0 {
-        eprintln!("  Deleted {} empty directories", deleted_count);
+    if (verbose || dry_run) && deleted_count > 0 {
+        if dry_run {
+            println!("  [DRY RUN] Would delete {} empty directories", deleted_count);
+        } else {
+            eprintln!("  Deleted {} empty directories", deleted_count);
+        }
     }
 
     Ok(())
@@ -297,18 +467,22 @@ fn load_files(
     manifest: &Manifest,
     store: &Store,
     verbose: bool,
+    dry_run: bool,
     progress_config: ProgressConfig,
-) -> Result<LoadStats> {
-    if verbose {
-        eprintln!("Loading files from snapshot");
+    stats: Arc<Mutex<LoadStats>>,
+) -> Result<()> {
+    if verbose || dry_run {
+        if dry_run {
+            println!("\n[DRY RUN] Would load files from snapshot");
+        } else {
+            eprintln!("Loading files from snapshot");
+        }
     }
 
     let existing_files = scan_existing_files_in_manifest(root, manifest, progress_config)?;
 
     let total_bytes = manifest.total_size;
     let progress = ByteProgress::new(total_bytes, progress_config);
-
-    let stats = Arc::new(Mutex::new(LoadStats::default()));
 
     let entries: Vec<(&String, &crate::manifest::FileEntry)> = manifest
         .files
@@ -326,6 +500,7 @@ fn load_files(
                 store,
                 stats.clone(),
                 verbose,
+                dry_run,
                 &progress,
             )
         })
@@ -337,12 +512,7 @@ fn load_files(
 
     progress.finish();
 
-    let final_stats = Arc::try_unwrap(stats)
-        .expect("Stats still has references")
-        .into_inner()
-        .expect("Stats mutex poisoned");
-
-    Ok(final_stats)
+    Ok(())
 }
 
 /// Scan existing files mentioned in manifest and compute their hashes
@@ -380,26 +550,40 @@ fn load_single_file(
     store: &Store,
     stats: Arc<Mutex<LoadStats>>,
     verbose: bool,
+    dry_run: bool,
     progress: &ByteProgress,
 ) -> Result<()> {
     let dest_path = root.join(relative_path);
 
-    if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent)?;
+    if !dry_run {
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
     }
 
     if entry.is_symlink {
         if let Some(ref _target) = entry.symlink_target {
-            if dest_path.exists() || dest_path.symlink_metadata().is_ok() {
-                fs::remove_file(&dest_path)?;
-            }
+            if dry_run {
+                if verbose {
+                    println!("  [DRY RUN] Would restore symlink: {}", relative_path);
+                }
+            } else {
+                if dest_path.exists() || dest_path.symlink_metadata().is_ok() {
+                    fs::remove_file(&dest_path)?;
+                }
 
-            let target_path = store.retrieve_symlink_target(&entry.hash)?;
-            fs_utils::create_symlink(&target_path, &dest_path)?;
+                let target_path = store.retrieve_symlink_target(&entry.hash)?;
+                fs_utils::create_symlink(&target_path, &dest_path)?;
+                
+                if verbose {
+                    eprintln!("  Symlink restored: {}", relative_path);
+                }
+            }
             
             let mut s = stats.lock().unwrap();
             s.symlinks += 1;
             s.files_loaded += 1;
+            s.symlink_files.push(relative_path.to_string());
             
             progress.inc(entry.size);
         }
@@ -407,13 +591,18 @@ fn load_single_file(
     else {
         let needs_copy = if let Some(existing_hash) = existing_files.get(relative_path) {
             if existing_hash == &entry.hash {
-                if verbose {
-                    eprintln!("  Unchanged: {}", relative_path);
+                if verbose || dry_run {
+                    if dry_run {
+                        println!("  [DRY RUN] Unchanged: {}", relative_path);
+                    } else {
+                        eprintln!("  Unchanged: {}", relative_path);
+                    }
                 }
                 
                 let mut s = stats.lock().unwrap();
                 s.unchanged += 1;
                 s.files_loaded += 1;
+                s.unchanged_files.push(relative_path.to_string());
                 
                 progress.inc(entry.size);
                 
@@ -428,26 +617,35 @@ fn load_single_file(
         };
 
         if needs_copy {
-            store.copy_blob_to_file(&entry.hash, &dest_path)
-                .with_context(|| format!("Failed to copy blob for: {}", relative_path))?;
-            
-            if verbose {
-                eprintln!("  Loaded: {}", relative_path);
+            if dry_run {
+                if verbose {
+                    println!("  [DRY RUN] Would load: {}", relative_path);
+                }
+            } else {
+                store.copy_blob_to_file(&entry.hash, &dest_path)
+                    .with_context(|| format!("Failed to copy blob for: {}", relative_path))?;
+                
+                if verbose {
+                    eprintln!("  Loaded: {}", relative_path);
+                }
             }
             
             let mut s = stats.lock().unwrap();
             s.copies += 1;
             s.files_loaded += 1;
+            s.copied_files.push(relative_path.to_string());
             
             progress.inc(entry.size);
         }
 
-        #[cfg(unix)]
-        {
-            fs_utils::set_file_mode(&dest_path, entry.mode)?;
+        if !dry_run {
+            #[cfg(unix)]
+            {
+                fs_utils::set_file_mode(&dest_path, entry.mode)?;
+            }
+            
+            fs_utils::set_file_mtime(&dest_path, entry.mtime_secs, entry.mtime_nanos)?;
         }
-        
-        fs_utils::set_file_mtime(&dest_path, entry.mtime_secs, entry.mtime_nanos)?;
     }
 
     Ok(())
@@ -458,13 +656,18 @@ fn restore_directories(
     root: &Path,
     manifest: &Manifest,
     verbose: bool,
+    dry_run: bool,
 ) -> Result<()> {
     if manifest.directories.is_empty() {
         return Ok(());
     }
     
-    if verbose {
-        eprintln!("Restoring {} directories", manifest.directories.len());
+    if verbose || dry_run {
+        if dry_run {
+            println!("\n[DRY RUN] Would restore {} directories", manifest.directories.len());
+        } else {
+            eprintln!("Restoring {} directories", manifest.directories.len());
+        }
     }
     
     let mut dirs: Vec<(&String, &crate::manifest::DirectoryEntry)> = 
@@ -479,20 +682,28 @@ fn restore_directories(
         let dir_path = root.join(relative_path);
         
         if !dir_path.exists() {
-            fs::create_dir_all(&dir_path)
-                .with_context(|| format!("Failed to create directory: {}", dir_path.display()))?;
-            
-            if verbose {
-                eprintln!("  Created directory: {}", relative_path);
+            if dry_run {
+                if verbose {
+                    println!("  [DRY RUN] Would create directory: {}", relative_path);
+                }
+            } else {
+                fs::create_dir_all(&dir_path)
+                    .with_context(|| format!("Failed to create directory: {}", dir_path.display()))?;
+                
+                if verbose {
+                    eprintln!("  Created directory: {}", relative_path);
+                }
             }
         }
         
-        #[cfg(unix)]
-        {
-            fs_utils::set_file_mode(&dir_path, entry.mode)?;
+        if !dry_run {
+            #[cfg(unix)]
+            {
+                fs_utils::set_file_mode(&dir_path, entry.mode)?;
+            }
+            
+            fs_utils::set_file_mtime(&dir_path, entry.mtime_secs, entry.mtime_nanos)?;
         }
-        
-        fs_utils::set_file_mtime(&dir_path, entry.mtime_secs, entry.mtime_nanos)?;
     }
     
     Ok(())
@@ -529,6 +740,11 @@ pub struct LoadStats {
     pub copies: usize,
     pub unchanged: usize,
     pub symlinks: usize,
+    pub removed: usize,
+    pub copied_files: Vec<String>,
+    pub unchanged_files: Vec<String>,
+    pub symlink_files: Vec<String>,
+    pub removed_files: Vec<String>,
 }
 
 /// Find tracked directory roots by scanning the workspace for directories whose
@@ -690,6 +906,208 @@ mod tests {
         let found = find_tracked_directory_roots(temp_dir.path(), &manifest);
         // Should not find src inside .kibo
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn test_cleanup_root_only_pattern_preserves_subdirectory_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        let root_config = root.join("config.txt");
+        File::create(&root_config).unwrap().write_all(b"root config").unwrap();
+        
+        fs::create_dir(root.join("subdir")).unwrap();
+        let subdir_config = root.join("subdir/config.txt");
+        File::create(&subdir_config).unwrap().write_all(b"subdir config").unwrap();
+        
+        let mut manifest = Manifest::new("test".to_string());
+        manifest.set_tracked_paths(vec![], vec!["./config.txt".to_string()]);
+        
+        let hash = file_hash::hash_file(&root_config).unwrap();
+        let entry = FileEntry {
+            hash,
+            size: 11,
+            #[cfg(unix)]
+            mode: 0o644,
+            is_symlink: false,
+            symlink_target: None,
+            mtime_secs: 0,
+            mtime_nanos: 0,
+        };
+        manifest.add_file("config.txt".to_string(), entry);
+        
+        // should NOT delete subdir/config.txt because ./ pattern only matches root
+        let stats = Arc::new(Mutex::new(LoadStats::default()));
+        cleanup_stale_files(root, &manifest, false, false, stats).unwrap();
+        
+        assert!(root_config.exists(), "Root config.txt should exist");
+        
+        assert!(subdir_config.exists(), "Subdirectory config.txt should be preserved");
+    }
+
+    #[test]
+    fn test_cleanup_recursive_pattern_deletes_all_matches() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        let root_config = root.join("config.txt");
+        File::create(&root_config).unwrap().write_all(b"root config").unwrap();
+        
+        fs::create_dir(root.join("subdir")).unwrap();
+        let subdir_config = root.join("subdir/config.txt");
+        File::create(&subdir_config).unwrap().write_all(b"subdir config").unwrap();
+        
+        let mut manifest = Manifest::new("test".to_string());
+        manifest.set_tracked_paths(vec![], vec!["config.txt".to_string()]);
+        
+        let hash = file_hash::hash_file(&root_config).unwrap();
+        let entry = FileEntry {
+            hash,
+            size: 11,
+            #[cfg(unix)]
+            mode: 0o644,
+            is_symlink: false,
+            symlink_target: None,
+            mtime_secs: 0,
+            mtime_nanos: 0,
+        };
+        manifest.add_file("config.txt".to_string(), entry);
+        
+        // SHOULD delete subdir/config.txt because recursive pattern matches it
+        let stats = Arc::new(Mutex::new(LoadStats::default()));
+        cleanup_stale_files(root, &manifest, false, false, stats).unwrap();
+        
+        assert!(root_config.exists(), "Root config.txt should exist");
+        
+        assert!(!subdir_config.exists(), "Subdirectory config.txt should be deleted as stale");
+    }
+
+    #[test]
+    fn test_cleanup_root_only_wildcard_pattern() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        let root_data1 = root.join("data1.bin");
+        let root_data2 = root.join("data2.bin");
+        File::create(&root_data1).unwrap().write_all(b"data1").unwrap();
+        File::create(&root_data2).unwrap().write_all(b"data2").unwrap();
+        
+        fs::create_dir(root.join("nested")).unwrap();
+        let nested_data = root.join("nested/data3.bin");
+        File::create(&nested_data).unwrap().write_all(b"data3").unwrap();
+        
+        let mut manifest = Manifest::new("test".to_string());
+        manifest.set_tracked_paths(vec![], vec!["./*.bin".to_string()]);
+        
+        let hash = file_hash::hash_file(&root_data1).unwrap();
+        let entry = FileEntry {
+            hash,
+            size: 5,
+            #[cfg(unix)]
+            mode: 0o644,
+            is_symlink: false,
+            symlink_target: None,
+            mtime_secs: 0,
+            mtime_nanos: 0,
+        };
+        manifest.add_file("data1.bin".to_string(), entry);
+        
+        let stats = Arc::new(Mutex::new(LoadStats::default()));
+        cleanup_stale_files(root, &manifest, false, false, stats).unwrap();
+        
+        // data1.bin should exist (in manifest)
+        assert!(root_data1.exists(), "data1.bin should exist");
+        
+        // data2.bin should be deleted (matched by ./*.bin but not in manifest)
+        assert!(!root_data2.exists(), "data2.bin should be deleted as stale");
+        
+        // nested/data3.bin should NOT be deleted (not matched by ./*.bin pattern)
+        assert!(nested_data.exists(), "nested/data3.bin should be preserved");
+    }
+
+    #[test]
+    fn test_cleanup_root_only_subdirectory_pattern() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        fs::create_dir(root.join("data")).unwrap();
+        let root_file1 = root.join("data/file1.txt");
+        let root_file2 = root.join("data/file2.txt");
+        File::create(&root_file1).unwrap().write_all(b"file1").unwrap();
+        File::create(&root_file2).unwrap().write_all(b"file2").unwrap();
+        
+        fs::create_dir_all(root.join("project/data")).unwrap();
+        let nested_file = root.join("project/data/file3.txt");
+        File::create(&nested_file).unwrap().write_all(b"file3").unwrap();
+        
+        let mut manifest = Manifest::new("test".to_string());
+        manifest.set_tracked_paths(vec![], vec!["./data/*.txt".to_string()]);
+        
+        let hash = file_hash::hash_file(&root_file1).unwrap();
+        let entry = FileEntry {
+            hash,
+            size: 5,
+            #[cfg(unix)]
+            mode: 0o644,
+            is_symlink: false,
+            symlink_target: None,
+            mtime_secs: 0,
+            mtime_nanos: 0,
+        };
+        manifest.add_file("data/file1.txt".to_string(), entry);
+        
+        let stats = Arc::new(Mutex::new(LoadStats::default()));
+        cleanup_stale_files(root, &manifest, false, false, stats).unwrap();
+        
+        // file1.txt should exist (in manifest)
+        assert!(root_file1.exists(), "data/file1.txt should exist");
+        
+        // file2.txt should be deleted (matched by ./data/*.txt but not in manifest)
+        assert!(!root_file2.exists(), "data/file2.txt should be deleted as stale");
+        
+        // project/data/file3.txt should NOT be deleted (not matched by ./data/*.txt)
+        assert!(nested_file.exists(), "project/data/file3.txt should be preserved");
+    }
+
+    #[test]
+    fn test_cleanup_respects_root_only_vs_recursive() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        let root_makefile = root.join("Makefile");
+        File::create(&root_makefile).unwrap().write_all(b"root").unwrap();
+        
+        fs::create_dir(root.join("sub1")).unwrap();
+        let sub1_makefile = root.join("sub1/Makefile");
+        File::create(&sub1_makefile).unwrap().write_all(b"sub1").unwrap();
+        
+        fs::create_dir(root.join("sub2")).unwrap();
+        let sub2_makefile = root.join("sub2/Makefile");
+        File::create(&sub2_makefile).unwrap().write_all(b"sub2").unwrap();
+        
+        let mut manifest_root_only = Manifest::new("test".to_string());
+        manifest_root_only.set_tracked_paths(vec![], vec!["./Makefile".to_string()]);
+        
+        let hash = file_hash::hash_file(&root_makefile).unwrap();
+        let entry = FileEntry {
+            hash,
+            size: 4,
+            #[cfg(unix)]
+            mode: 0o644,
+            is_symlink: false,
+            symlink_target: None,
+            mtime_secs: 0,
+            mtime_nanos: 0,
+        };
+        manifest_root_only.add_file("Makefile".to_string(), entry);
+        
+        let stats = Arc::new(Mutex::new(LoadStats::default()));
+        cleanup_stale_files(root, &manifest_root_only, false, false, stats).unwrap();
+        
+        // With ./ pattern: subdirectory Makefiles should NOT be deleted
+        assert!(root_makefile.exists(), "Root Makefile should exist");
+        assert!(sub1_makefile.exists(), "sub1/Makefile should be preserved (not matched by ./)");
+        assert!(sub2_makefile.exists(), "sub2/Makefile should be preserved (not matched by ./)");
     }
 }
 

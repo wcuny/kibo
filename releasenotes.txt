@@ -7,6 +7,8 @@ v0.2.0
 - added --dry-run option to the load command to show what would be done without actually doing it
 - added removed files to the summary at the end of the load process
 - optimized save and load by skipping ignored patterns earlier in the process
+- fixed issue where dot directories could not be tracked
+- fixed issue where symlinks were unnecessarily recreated on every load
 
 v0.1.0
 - initial release

@@ -529,10 +529,17 @@ fn scan_existing_files_in_manifest(
         .par_iter()
         .filter_map(|relative_path| {
             let path = root.join(relative_path);
-            if !path.exists() {
+            // Use symlink_metadata to check existence without following symlinks
+            if path.symlink_metadata().is_err() {
                 return None;
             }
-            let hash = file_hash::hash_file(&path).ok()?;
+            
+            // Check if it's a symlink and hash accordingly
+            let hash = if path.symlink_metadata().ok()?.is_symlink() {
+                file_hash::hash_symlink(&path).ok()?
+            } else {
+                file_hash::hash_file(&path).ok()?
+            };
             Some((relative_path.clone(), hash))
         })
         .collect();
@@ -563,29 +570,57 @@ fn load_single_file(
 
     if entry.is_symlink {
         if let Some(ref _target) = entry.symlink_target {
-            if dry_run {
-                if verbose {
-                    println!("  [DRY RUN] Would restore symlink: {}", relative_path);
+            // Check if symlink already exists with correct target
+            let needs_restore = if let Some(existing_hash) = existing_files.get(relative_path) {
+                if existing_hash == &entry.hash {
+                    if verbose || dry_run {
+                        if dry_run {
+                            println!("  [DRY RUN] Symlink unchanged: {}", relative_path);
+                        } else {
+                            eprintln!("  Symlink unchanged: {}", relative_path);
+                        }
+                    }
+                    
+                    let mut s = stats.lock().unwrap();
+                    s.unchanged += 1;
+                    s.files_loaded += 1;
+                    s.unchanged_files.push(relative_path.to_string());
+                    
+                    progress.inc(entry.size);
+                    
+                    false
+                } else {
+                    true
                 }
             } else {
-                if dest_path.exists() || dest_path.symlink_metadata().is_ok() {
-                    fs::remove_file(&dest_path)?;
-                }
+                true
+            };
+            
+            if needs_restore {
+                if dry_run {
+                    if verbose {
+                        println!("  [DRY RUN] Would restore symlink: {}", relative_path);
+                    }
+                } else {
+                    if dest_path.exists() || dest_path.symlink_metadata().is_ok() {
+                        fs::remove_file(&dest_path)?;
+                    }
 
-                let target_path = store.retrieve_symlink_target(&entry.hash)?;
-                fs_utils::create_symlink(&target_path, &dest_path)?;
-                
-                if verbose {
-                    eprintln!("  Symlink restored: {}", relative_path);
+                    let target_path = store.retrieve_symlink_target(&entry.hash)?;
+                    fs_utils::create_symlink(&target_path, &dest_path)?;
+                    
+                    if verbose {
+                        eprintln!("  Symlink restored: {}", relative_path);
+                    }
                 }
+                
+                let mut s = stats.lock().unwrap();
+                s.symlinks += 1;
+                s.files_loaded += 1;
+                s.symlink_files.push(relative_path.to_string());
+                
+                progress.inc(entry.size);
             }
-            
-            let mut s = stats.lock().unwrap();
-            s.symlinks += 1;
-            s.files_loaded += 1;
-            s.symlink_files.push(relative_path.to_string());
-            
-            progress.inc(entry.size);
         }
     }
     else {
@@ -1108,6 +1143,210 @@ mod tests {
         assert!(root_makefile.exists(), "Root Makefile should exist");
         assert!(sub1_makefile.exists(), "sub1/Makefile should be preserved (not matched by ./)");
         assert!(sub2_makefile.exists(), "sub2/Makefile should be preserved (not matched by ./)");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_existing_files_includes_symlinks() {
+        use std::os::unix::fs::symlink;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        // Create a regular file
+        let regular_file = root.join("regular.txt");
+        File::create(&regular_file).unwrap().write_all(b"regular").unwrap();
+        
+        // Create a symlink
+        let target_file = root.join("target.txt");
+        File::create(&target_file).unwrap().write_all(b"target").unwrap();
+        let link_file = root.join("link.txt");
+        symlink("target.txt", &link_file).unwrap();
+        
+        // Create manifest with both
+        let mut manifest = Manifest::new("test".to_string());
+        
+        let regular_hash = file_hash::hash_file(&regular_file).unwrap();
+        let regular_entry = FileEntry {
+            hash: regular_hash.clone(),
+            size: 7,
+            #[cfg(unix)]
+            mode: 0o644,
+            is_symlink: false,
+            symlink_target: None,
+            mtime_secs: 0,
+            mtime_nanos: 0,
+        };
+        manifest.add_file("regular.txt".to_string(), regular_entry);
+        
+        let symlink_hash = file_hash::hash_symlink(&link_file).unwrap();
+        let symlink_entry = FileEntry {
+            hash: symlink_hash.clone(),
+            size: 0,
+            #[cfg(unix)]
+            mode: 0o644,
+            is_symlink: true,
+            symlink_target: Some("target.txt".to_string()),
+            mtime_secs: 0,
+            mtime_nanos: 0,
+        };
+        manifest.add_file("link.txt".to_string(), symlink_entry);
+        
+        let existing = scan_existing_files_in_manifest(root, &manifest, ProgressConfig::Auto).unwrap();
+        
+        // Both files should be in the map
+        assert_eq!(existing.len(), 2, "Should detect both regular file and symlink");
+        assert_eq!(existing.get("regular.txt"), Some(&regular_hash), "Regular file hash should match");
+        assert_eq!(existing.get("link.txt"), Some(&symlink_hash), "Symlink hash should match");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_symlink_unchanged_not_recreated() {
+        use std::os::unix::fs::symlink;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        let store = Store::new(root);
+        store.init().unwrap();
+        
+        // Create target file
+        let target = root.join("target.txt");
+        File::create(&target).unwrap().write_all(b"target").unwrap();
+        
+        // Create symlink
+        let link = root.join("link.txt");
+        symlink("target.txt", &link).unwrap();
+        
+        // Store the symlink target in the store
+        let symlink_hash = file_hash::hash_symlink(&link).unwrap();
+        store.store_symlink(&link, &symlink_hash).unwrap();
+        
+        // Get original metadata
+        let original_metadata = link.symlink_metadata().unwrap();
+        let original_mtime = original_metadata.modified().unwrap();
+        
+        // Sleep briefly to ensure time would change if recreated
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        
+        // Create manifest with symlink
+        let mut manifest = Manifest::new("test".to_string());
+        let entry = FileEntry {
+            hash: symlink_hash,
+            size: 0,
+            #[cfg(unix)]
+            mode: 0o755,
+            is_symlink: true,
+            symlink_target: Some("target.txt".to_string()),
+            mtime_secs: 0,
+            mtime_nanos: 0,
+        };
+        manifest.add_file("link.txt".to_string(), entry);
+        
+        // Create existing_files map with the symlink
+        let existing_files: HashMap<String, String> = 
+            scan_existing_files_in_manifest(root, &manifest, ProgressConfig::Auto).unwrap();
+        
+        // Load the file (should skip because unchanged)
+        let stats = Arc::new(Mutex::new(LoadStats::default()));
+        let progress = ByteProgress::new(0, ProgressConfig::ForceDisable);
+        
+        load_single_file(
+            root,
+            "link.txt",
+            manifest.files.get("link.txt").unwrap(),
+            &existing_files,
+            &store,
+            stats.clone(),
+            false,
+            false,
+            &progress,
+        ).unwrap();
+        
+        // Check that symlink was not recreated (mtime should be unchanged)
+        let new_metadata = link.symlink_metadata().unwrap();
+        let new_mtime = new_metadata.modified().unwrap();
+        
+        assert_eq!(original_mtime, new_mtime, "Symlink should not be recreated when unchanged");
+        
+        // Check stats show it as unchanged
+        let final_stats = stats.lock().unwrap();
+        assert_eq!(final_stats.unchanged, 1, "Should count as unchanged");
+        assert_eq!(final_stats.symlinks, 0, "Should not count as new symlink");
+        assert_eq!(final_stats.unchanged_files.len(), 1, "Should be in unchanged list");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_symlink_changed_is_recreated() {
+        use std::os::unix::fs::symlink;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        let store = Store::new(root);
+        store.init().unwrap();
+        
+        // Create initial target and symlink
+        let old_target = root.join("old_target.txt");
+        File::create(&old_target).unwrap().write_all(b"old").unwrap();
+        let link = root.join("link.txt");
+        symlink("old_target.txt", &link).unwrap();
+        
+        // Create NEW target and store its symlink target in the store
+        let new_target = root.join("new_target.txt");
+        File::create(&new_target).unwrap().write_all(b"new").unwrap();
+        
+        // Hash what the new symlink target would be (hash of the string "new_target.txt")
+        let new_symlink_hash = blake3::hash(b"new_target.txt").to_hex().to_string();
+        
+        // Store the symlink target (the string "new_target.txt")
+        store.store_symlink(Path::new("new_target.txt"), &new_symlink_hash).unwrap();
+        
+        // Create manifest with NEW target
+        let mut manifest = Manifest::new("test".to_string());
+        let entry = FileEntry {
+            hash: new_symlink_hash,
+            size: 0,
+            #[cfg(unix)]
+            mode: 0o755,
+            is_symlink: true,
+            symlink_target: Some("new_target.txt".to_string()),
+            mtime_secs: 0,
+            mtime_nanos: 0,
+        };
+        manifest.add_file("link.txt".to_string(), entry);
+        
+        // existing_files will have the OLD hash
+        let existing_files: HashMap<String, String> = 
+            scan_existing_files_in_manifest(root, &manifest, ProgressConfig::Auto).unwrap();
+        
+        // Load the file (should recreate because changed)
+        let stats = Arc::new(Mutex::new(LoadStats::default()));
+        let progress = ByteProgress::new(0, ProgressConfig::ForceDisable);
+        
+        load_single_file(
+            root,
+            "link.txt",
+            manifest.files.get("link.txt").unwrap(),
+            &existing_files,
+            &store,
+            stats.clone(),
+            false,
+            false,
+            &progress,
+        ).unwrap();
+        
+        // Check that symlink now points to new target
+        let target = fs::read_link(&link).unwrap();
+        assert_eq!(target.to_string_lossy(), "new_target.txt", "Symlink should point to new target");
+        
+        // Check stats show it as new symlink
+        let final_stats = stats.lock().unwrap();
+        assert_eq!(final_stats.symlinks, 1, "Should count as restored symlink");
+        assert_eq!(final_stats.unchanged, 0, "Should not count as unchanged");
+        assert_eq!(final_stats.symlink_files.len(), 1, "Should be in symlink list");
     }
 }
 

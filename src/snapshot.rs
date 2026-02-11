@@ -166,10 +166,6 @@ fn collect_files(
                 if e.file_name() == ".kibo" {
                     return false;
                 }
-                let name = e.file_name().to_string_lossy();
-                if name.starts_with('.') && name != "." {
-                    return false;
-                }
 
                 if let Ok(rel_path) = e.path().strip_prefix(root) {
                     if config.should_ignore(rel_path) {
@@ -315,10 +311,6 @@ fn collect_directories(
             .into_iter()
             .filter_entry(|e| {
                 if e.file_name() == ".kibo" {
-                    return false;
-                }
-                let name = e.file_name().to_string_lossy();
-                if name.starts_with('.') && name != "." {
                     return false;
                 }
 
@@ -828,6 +820,92 @@ mod tests {
         assert!(file_names.contains(&"target.txt".to_string()));
         assert!(file_names.contains(&"link1.txt".to_string()));
         assert!(file_names.contains(&"link2.txt".to_string()));
+    }
+
+    #[test]
+    fn test_collect_files_dot_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        // Create a dot directory with files
+        fs::create_dir(root.join(".moc")).unwrap();
+        let moc_file1 = root.join(".moc/file1.o");
+        let moc_file2 = root.join(".moc/file2.o");
+        File::create(&moc_file1).unwrap().write_all(b"moc1").unwrap();
+        File::create(&moc_file2).unwrap().write_all(b"moc2").unwrap();
+        
+        // Create another dot directory
+        fs::create_dir(root.join(".ui")).unwrap();
+        let ui_file = root.join(".ui/main.ui");
+        File::create(&ui_file).unwrap().write_all(b"ui").unwrap();
+        
+        let config = Config {
+            directories: vec![".moc".to_string(), ".ui".to_string()],
+            ..Default::default()
+        };
+        
+        let files = collect_files(root, &config, false).unwrap();
+        
+        assert_eq!(files.len(), 3, "Expected 3 files from dot directories");
+        
+        let file_names: Vec<String> = files.iter()
+            .map(|(rel_path, _)| rel_path.clone())
+            .collect();
+        
+        assert!(file_names.contains(&".moc/file1.o".to_string()), "Missing .moc/file1.o");
+        assert!(file_names.contains(&".moc/file2.o".to_string()), "Missing .moc/file2.o");
+        assert!(file_names.contains(&".ui/main.ui".to_string()), "Missing .ui/main.ui");
+    }
+
+    #[test]
+    fn test_collect_directories_dot_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        // Create dot directories
+        fs::create_dir(root.join(".cache")).unwrap();
+        fs::create_dir(root.join(".config")).unwrap();
+        
+        // Create a nested structure with dot directory
+        fs::create_dir_all(root.join("project/.build")).unwrap();
+        
+        let config = Config {
+            directories: vec![".cache".to_string(), ".config".to_string(), ".build".to_string()],
+            ..Default::default()
+        };
+        
+        let dirs = collect_directories(root, &config, false).unwrap();
+        
+        assert_eq!(dirs.len(), 3, "Expected 3 dot directories");
+        
+        let dir_names: Vec<String> = dirs.iter()
+            .map(|(rel_path, _)| rel_path.clone())
+            .collect();
+        
+        assert!(dir_names.contains(&".cache".to_string()), "Missing .cache");
+        assert!(dir_names.contains(&".config".to_string()), "Missing .config");
+        assert!(dir_names.contains(&"project/.build".to_string()), "Missing project/.build");
+    }
+
+    #[test]
+    fn test_collect_files_nested_in_dot_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        // Create structure: .hidden/src/code.rs
+        fs::create_dir_all(root.join(".hidden/src")).unwrap();
+        let code_file = root.join(".hidden/src/code.rs");
+        File::create(&code_file).unwrap().write_all(b"code").unwrap();
+        
+        let config = Config {
+            directories: vec!["src".to_string()],
+            ..Default::default()
+        };
+        
+        let files = collect_files(root, &config, false).unwrap();
+        
+        assert_eq!(files.len(), 1, "Expected 1 file from src inside .hidden");
+        assert_eq!(files[0].0, ".hidden/src/code.rs");
     }
 
     // Note: collect_directories requires integration testing with proper workspace structure
